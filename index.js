@@ -162,6 +162,19 @@ io.on("connection", (socket) => {
         io.to(roomCode).emit("game_reset", room.players);
     }
   });
+
+  // 7. CHAT DE SALA
+  socket.on("send_chat", ({ roomCode, message, playerName }) => {
+    // Validar que no esté vacío y limitar caracteres
+    if (!message || message.trim() === "") return;
+    const cleanMessage = message.trim().substring(0, 50); // Máx 50 caracteres
+
+    // Reenviar a TODOS en la sala (incluido el que lo envió)
+    io.to(roomCode).emit("receive_chat", {
+        playerName,
+        message: cleanMessage
+    });
+  });
 });
 
 const PORT = process.env.PORT || 3000;
