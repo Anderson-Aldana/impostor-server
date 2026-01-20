@@ -4,14 +4,28 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 
 const app = express();
-app.use(cors());
+
+// 1. SEGURIDAD CORS: Solo permitimos tu web en Vercel y localhost (para pruebas)
+const ALLOWED_ORIGINS = [
+  "https://impostor-play.vercel.app"
+];
+
+app.use(cors({
+  origin: ALLOWED_ORIGINS
+}));
 
 const httpServer = createServer(app);
 const io = new Server(httpServer, {
-  cors: { origin: "*" }
+  cors: {
+    origin: ALLOWED_ORIGINS,
+    methods: ["GET", "POST"]
+  }
 });
 
 const rooms = {};
+
+// Mapa para controlar la velocidad de creación de salas (Rate Limiting)
+const roomCreationLimits = new Map();
 
 function generateUniqueRoomCode() {
   const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
@@ -25,11 +39,28 @@ function generateUniqueRoomCode() {
   return result;
 }
 
+// Función auxiliar para limpiar texto (Sanitización básica en servidor)
+function sanitizeInput(str) {
+    if (!str) return "";
+    return String(str).trim().substring(0, 50).replace(/[<>]/g, ""); // Elimina < y >
+}
+
 io.on("connection", (socket) => {
   console.log("Conectado:", socket.id);
 
-  // 1. CREAR SALA
-  socket.on("create_room", (playerName) => {
+  // --- CREAR SALA (CON PROTECCIÓN DE RATE LIMIT) ---
+  socket.on("create_room", (rawPlayerName) => {
+    // 2. RATE LIMITING: Evitar crear más de 1 sala cada 10 segundos por socket
+    const lastCreation = roomCreationLimits.get(socket.id);
+    const now = Date.now();
+    if (lastCreation && now - lastCreation < 10000) {
+        return socket.emit("error_message", "Espera unos segundos antes de crear otra sala.");
+    }
+    roomCreationLimits.set(socket.id, now);
+
+    const playerName = sanitizeInput(rawPlayerName);
+    if (!playerName) return socket.emit("error_message", "Nombre inválido.");
+
     const roomCode = generateUniqueRoomCode();
     rooms[roomCode] = {
       host: socket.id,
@@ -38,7 +69,6 @@ io.on("connection", (socket) => {
     };
     socket.join(roomCode);
     
-    // Avisar al creador
     socket.emit("room_created", { 
         roomCode, 
         isHost: true, 
@@ -46,10 +76,13 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 2. UNIRSE A SALA (CORREGIDO)
-  socket.on("join_room", ({ roomCode, playerName }) => {
-    roomCode = roomCode.toUpperCase();
-    const room = rooms[roomCode];
+  // --- UNIRSE A SALA ---
+  socket.on("join_room", ({ roomCode, playerName: rawName }) => {
+    const playerName = sanitizeInput(rawName);
+    if (!roomCode || !playerName) return socket.emit("error_message", "Datos inválidos.");
+
+    const code = roomCode.toUpperCase(); // Sanitizar código
+    const room = rooms[code];
     
     if (!room) return socket.emit("error_message", "Sala no encontrada.");
     if (room.gameState !== "lobby") return socket.emit("error_message", "La partida ya empezó.");
@@ -60,44 +93,29 @@ io.on("connection", (socket) => {
     if (nameExists) return socket.emit("error_message", "Ese nombre ya está en uso.");
 
     room.players.push({ id: socket.id, name: playerName });
-    socket.join(roomCode);
+    socket.join(code);
 
-    // IMPORTANTE: Avisar AL INVITADO que entró con éxito
-    socket.emit("join_success", { 
-        roomCode, 
-        players: room.players 
-    });
-
-    // Avisar a TODOS que la lista cambió
-    io.to(roomCode).emit("update_players", room.players);
+    socket.emit("join_success", { roomCode: code, players: room.players });
+    io.to(code).emit("update_players", room.players);
   });
 
-  // FUNCIÓN AUXILIAR: Manejar la salida de un jugador
+  // --- MANEJO DE SALIDA ---
   const handlePlayerExit = (roomCode) => {
     const room = rooms[roomCode];
     if (!room) return;
 
     const playerIndex = room.players.findIndex(p => p.id === socket.id);
     if (playerIndex !== -1) {
-        // 1. Guardamos si el que se va es el Host
         const wasHost = (room.host === socket.id);
-        
-        // 2. Lo sacamos de la lista
-        const removedPlayer = room.players[playerIndex];
         room.players.splice(playerIndex, 1);
         
-        // 3. Verificamos si la sala quedó vacía
         if (room.players.length === 0) {
             delete rooms[roomCode];
             console.log(`Sala ${roomCode} eliminada (vacía).`);
         } else {
-            // 4. MIGRACIÓN DE HOST: Si el host se fue, el siguiente (índice 0) hereda
             if (wasHost) {
-                room.host = room.players[0].id;
-                console.log(`Nuevo Host en ${roomCode}: ${room.players[0].name}`);
+                room.host = room.players[0].id; // Nuevo host
             }
-
-            // 5. Enviamos la lista actualizada Y quién es el host actual
             io.to(roomCode).emit("update_players", {
                 players: room.players,
                 hostId: room.host
@@ -106,16 +124,18 @@ io.on("connection", (socket) => {
     }
   };
 
-  // 3. SALIR DE SALA (Botón)
   socket.on("leave_room", (roomCode) => {
     handlePlayerExit(roomCode);
     socket.leave(roomCode);
   });
 
-  // 4. INICIAR JUEGO
+  // --- INICIAR JUEGO ---
   socket.on("start_game", ({ roomCode, wordData, impostorCount }) => {
     const room = rooms[roomCode];
     if (!room || room.host !== socket.id) return;
+
+    // Validación básica de datos del juego
+    if (!wordData || !wordData.word || !wordData.category) return;
 
     const playerIds = room.players.map(p => p.id);
     const impostors = [];
@@ -139,41 +159,38 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 5. DESCONEXIÓN (Cerrar pestaña)
   socket.on("disconnect", () => {
-    // Buscamos en qué sala estaba el socket
+    roomCreationLimits.delete(socket.id); // Limpiar memoria
     for (const code in rooms) {
-      const room = rooms[code];
-      if (room.players.find(p => p.id === socket.id)) {
+      if (rooms[code].players.find(p => p.id === socket.id)) {
         handlePlayerExit(code);
         break; 
       }
     }
   });
 
-  // 6. REINICIAR PARTIDA (Volver al Lobby)
   socket.on("reset_game", (roomCode) => {
     const room = rooms[roomCode];
-    
-    // Solo el anfitrión puede reiniciar
     if (room && room.host === socket.id) {
         room.gameState = "lobby";
-        // Avisamos a TODOS en la sala que vuelvan al lobby
         io.to(roomCode).emit("game_reset", room.players);
     }
   });
 
-  // 7. CHAT DE SALA
+  // --- CHAT (Sanitizado) ---
   socket.on("send_chat", ({ roomCode, message, playerName }) => {
-    // Validar que no esté vacío y limitar caracteres
-    if (!message || message.trim() === "") return;
-    const cleanMessage = message.trim().substring(0, 50); // Máx 50 caracteres
+    if (!message || typeof message !== 'string') return;
+    
+    // 3. SANITIZACIÓN: Limpiar mensaje y limitar longitud
+    const cleanMessage = sanitizeInput(message);
+    const cleanName = sanitizeInput(playerName);
 
-    // Reenviar a TODOS en la sala (incluido el que lo envió)
-    io.to(roomCode).emit("receive_chat", {
-        playerName,
-        message: cleanMessage
-    });
+    if (cleanMessage.length > 0) {
+        io.to(roomCode).emit("receive_chat", {
+            playerName: cleanName,
+            message: cleanMessage
+        });
+    }
   });
 });
 
