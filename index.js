@@ -72,24 +72,44 @@ io.on("connection", (socket) => {
     io.to(roomCode).emit("update_players", room.players);
   });
 
-  // 3. SALIR DE SALA (NUEVO)
-  socket.on("leave_room", (roomCode) => {
+  // FUNCIÓN AUXILIAR: Manejar la salida de un jugador
+  const handlePlayerExit = (roomCode) => {
     const room = rooms[roomCode];
-    if (room) {
-        const playerIndex = room.players.findIndex(p => p.id === socket.id);
-        if (playerIndex !== -1) {
-            room.players.splice(playerIndex, 1);
-            socket.leave(roomCode);
-            
-            if (room.players.length === 0) {
-                delete rooms[roomCode];
-            } else {
-                // Si el host se va, el juego podría romperse, o asignamos nuevo host. 
-                // Por simplicidad, solo actualizamos lista.
-                io.to(roomCode).emit("update_players", room.players);
+    if (!room) return;
+
+    const playerIndex = room.players.findIndex(p => p.id === socket.id);
+    if (playerIndex !== -1) {
+        // 1. Guardamos si el que se va es el Host
+        const wasHost = (room.host === socket.id);
+        
+        // 2. Lo sacamos de la lista
+        const removedPlayer = room.players[playerIndex];
+        room.players.splice(playerIndex, 1);
+        
+        // 3. Verificamos si la sala quedó vacía
+        if (room.players.length === 0) {
+            delete rooms[roomCode];
+            console.log(`Sala ${roomCode} eliminada (vacía).`);
+        } else {
+            // 4. MIGRACIÓN DE HOST: Si el host se fue, el siguiente (índice 0) hereda
+            if (wasHost) {
+                room.host = room.players[0].id;
+                console.log(`Nuevo Host en ${roomCode}: ${room.players[0].name}`);
             }
+
+            // 5. Enviamos la lista actualizada Y quién es el host actual
+            io.to(roomCode).emit("update_players", {
+                players: room.players,
+                hostId: room.host
+            });
         }
     }
+  };
+
+  // 3. SALIR DE SALA (Botón)
+  socket.on("leave_room", (roomCode) => {
+    handlePlayerExit(roomCode);
+    socket.leave(roomCode);
   });
 
   // 4. INICIAR JUEGO
@@ -119,16 +139,14 @@ io.on("connection", (socket) => {
     });
   });
 
-  // 5. DESCONEXIÓN
+  // 5. DESCONEXIÓN (Cerrar pestaña)
   socket.on("disconnect", () => {
+    // Buscamos en qué sala estaba el socket
     for (const code in rooms) {
       const room = rooms[code];
-      const idx = room.players.findIndex(p => p.id === socket.id);
-      if (idx !== -1) {
-        room.players.splice(idx, 1);
-        if (room.players.length === 0) delete rooms[code];
-        else io.to(code).emit("update_players", room.players);
-        break;
+      if (room.players.find(p => p.id === socket.id)) {
+        handlePlayerExit(code);
+        break; 
       }
     }
   });
