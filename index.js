@@ -132,6 +132,18 @@ io.on("connection", (socket) => {
       }
     }
   });
+
+  // 6. REINICIAR PARTIDA (Volver al Lobby)
+  socket.on("reset_game", (roomCode) => {
+    const room = rooms[roomCode];
+    
+    // Solo el anfitrión puede reiniciar
+    if (room && room.host === socket.id) {
+        room.gameState = "lobby";
+        // Avisamos a TODOS en la sala que vuelvan al lobby
+        io.to(roomCode).emit("game_reset", room.players);
+    }
+  });
 });
 
 const PORT = process.env.PORT || 3000;
