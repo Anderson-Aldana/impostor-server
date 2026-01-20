@@ -5,7 +5,7 @@ const cors = require("cors");
 
 const app = express();
 
-// 1. SEGURIDAD CORS: Solo permitimos tu web en Vercel y localhost (para pruebas)
+// 1. SEGURIDAD CORS
 const ALLOWED_ORIGINS = [
   "https://impostor-play.vercel.app"
 ];
