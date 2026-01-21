@@ -130,6 +130,9 @@ io.on("connection", (socket) => {
   });
 
   // --- INICIAR JUEGO ---
+  // index.js
+
+  // --- INICIAR JUEGO ---
   socket.on("start_game", ({ roomCode, wordData, impostorCount }) => {
     const room = rooms[roomCode];
     if (!room || room.host !== socket.id) return;
@@ -147,6 +150,10 @@ io.on("connection", (socket) => {
         if (!impostors.includes(playerIds[r])) impostors.push(playerIds[r]);
     }
 
+    // === NUEVO: ELEGIR JUGADOR INICIAL ===
+    const startingPlayerIndex = Math.floor(Math.random() * room.players.length);
+    const startingPlayerName = room.players[startingPlayerIndex].name;
+
     room.gameState = "playing";
     room.players.forEach(player => {
         const isImpostor = impostors.includes(player.id);
@@ -154,7 +161,8 @@ io.on("connection", (socket) => {
             role: isImpostor ? "impostor" : "citizen",
             word: isImpostor ? null : wordData.word,
             category: wordData.category,
-            impostorHint: isImpostor ? wordData.hint : null
+            impostorHint: isImpostor ? wordData.hint : null,
+            startingPlayer: startingPlayerName // <--- Enviamos esto
         });
     });
   });
