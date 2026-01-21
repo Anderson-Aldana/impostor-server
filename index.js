@@ -276,12 +276,10 @@ function processVotingResult(roomCode) {
         tallies[targetId] = (tallies[targetId] || 0) + 1;
     });
 
-    // 2. Encontrar quién tuvo más votos
+    // 2. Encontrar al más votado
     let maxVotes = -1;
     let eliminatedId = null;
     
-    // En caso de empate, eliminamos al primero que encontremos (simple) 
-    // o a nadie (lógica compleja). Para este juego rápido: ELIMINA AL MÁS VOTADO.
     for (const [target, count] of Object.entries(tallies)) {
         if (count > maxVotes) {
             maxVotes = count;
@@ -291,50 +289,66 @@ function processVotingResult(roomCode) {
 
     // 3. Ejecutar Eliminación
     const victimIndex = room.players.findIndex(p => p.id === eliminatedId);
+    
     if (victimIndex !== -1) {
         const victim = room.players[victimIndex];
-        victim.isDead = true; // MARCAR COMO MUERTO (NO BORRAR DEL ARRAY)
+        victim.isDead = true; 
         
-        // Notificar eliminación
+        // Datos del rol de la víctima para revelar a todos
+        const wasImpostor = (victim.roleData && victim.roleData.role === 'impostor');
+
+        // Notificar eliminación (Revelando si era o no impostor)
         room.players.forEach(p => {
              io.to(p.id).emit("player_eliminated", {
                  eliminatedId: victim.id,
                  playerName: victim.name,
-                 isYou: (p.id === victim.id)
+                 isYou: (p.id === victim.id),
+                 wasImpostor: wasImpostor // <--- ENVIAMOS ESTE DATO
              });
         });
 
-        // 4. VERIFICAR CONDICIONES DE VICTORIA/DERROTA
+        // 4. VERIFICAR CONDICIONES DE VICTORIA
+
+        // A) Si eliminaron al Impostor (o a TODOS los impostores si hay varios)
+        const remainingImpostors = room.players.filter(p => !p.isDead && p.roleData.role === 'impostor');
         
-        // A) ¿Era el impostor?
-        if (victim.roleData && victim.roleData.role === 'impostor') {
+        if (remainingImpostors.length === 0) {
             io.to(roomCode).emit("game_over", { 
                 winner: 'citizen', 
-                reason: `¡Atraparon al Impostor (${victim.name})!` 
+                reason: `¡Eliminaron a ${victim.name}! Era el Impostor.`,
+                impostorNames: [victim.name] // Para mostrar quién era
             });
-            resetRoomToLobby(room); // Función para volver al lobby
+            resetRoomToLobby(room);
             return;
         }
 
-        // B) ¿Cuántos quedan?
+        // B) Si ganan los Impostores
+        // Regla: Ganan si son igual o más cantidad que los ciudadanos (ej: 1 Imp vs 1 Ciudadano, o 2 vs 2)
         const survivors = room.players.filter(p => !p.isDead);
-        
-        // REGLA DEL USUARIO: Si quedan 3 o menos (y el impostor sigue vivo), gana el Impostor.
-        // Ojo: Si eran 4, eliminamos a 1 inocente -> quedan 3 -> GAME OVER.
-        if (survivors.length <= 3) {
+        const impostorsCount = remainingImpostors.length;
+        const citizensCount = survivors.length - impostorsCount;
+
+        if (impostorsCount >= citizensCount) {
+            // Obtenemos los nombres de TODOS los impostores (vivos y muertos) para revelarlos
+            const allImpostors = room.players
+                .filter(p => p.roleData.role === 'impostor')
+                .map(p => p.name);
+
             io.to(roomCode).emit("game_over", { 
                 winner: 'impostor', 
-                reason: "Quedan pocos jugadores. El Impostor domina la nave." 
+                reason: "Los Impostores han tomado el control de la nave.",
+                impostorNames: allImpostors // <--- LISTA DE NOMBRES
             });
-            resetRoomToLobby(room); // Función para volver al lobby
+            resetRoomToLobby(room);
             return;
         }
 
-        // 5. SI EL JUEGO SIGUE (NEXT ROUND)
+        // 5. EL JUEGO SIGUE (NEXT ROUND)
+        // Si había 4 jugadores (1 Imp, 3 Cit) y se va 1 Cit -> Quedan 3 (1 Imp, 2 Cit).
+        // 1 < 2, así que entra aquí y sigue jugando.
         room.gameState = "playing";
-        room.votes = {}; // Limpiar votos
+        room.votes = {}; 
         
-        // Elegir nuevo jugador inicial AL AZAR entre los vivos
         const randomSurvivor = survivors[Math.floor(Math.random() * survivors.length)];
         
         io.to(roomCode).emit("next_round", {
@@ -342,9 +356,11 @@ function processVotingResult(roomCode) {
         });
 
     } else {
-        // Caso raro: Empate a 0 votos o error. Seguimos jugando.
+        // Empate o error
         room.gameState = "playing";
-        io.to(roomCode).emit("next_round", { startingPlayer: room.players.find(p => !p.isDead).name });
+        room.votes = {};
+        const survivors = room.players.filter(p => !p.isDead);
+        io.to(roomCode).emit("next_round", { startingPlayer: survivors[0].name });
     }
 }
 
