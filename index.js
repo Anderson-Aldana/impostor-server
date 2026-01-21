@@ -5,6 +5,8 @@ const cors = require("cors");
 
 const app = express();
 
+const disconnectTimers = {};
+
 // 1. SEGURIDAD CORS
 const ALLOWED_ORIGINS = [
   "https://impostor-play.vercel.app"
@@ -47,6 +49,54 @@ function sanitizeInput(str) {
 
 io.on("connection", (socket) => {
   console.log("Conectado:", socket.id);
+
+  // --- EVENTO DE RECONEXIÓN ---
+  socket.on("rejoin_room", ({ roomCode, playerName }) => {
+    const code = sanitizeInput(roomCode);
+    const name = sanitizeInput(playerName);
+    const room = rooms[code];
+
+    if (!room) {
+        // La sala ya no existe, decirle al cliente que borre su memoria
+        return socket.emit("error_message", "La sala ya no existe.");
+    }
+
+    // Buscar al jugador por nombre (ya que el socket.id cambió al recargar)
+    const playerIndex = room.players.findIndex(p => p.name === name);
+
+    if (playerIndex !== -1) {
+        const oldSocketId = room.players[playerIndex].id;
+        
+        // 1. Cancelar la "muerte" pendiente del socket anterior
+        if (disconnectTimers[oldSocketId]) {
+            clearTimeout(disconnectTimers[oldSocketId]);
+            delete disconnectTimers[oldSocketId];
+            console.log(`Reconexión exitosa: ${name} recuperado.`);
+        }
+
+        // 2. Actualizar el ID del jugador al nuevo socket
+        room.players[playerIndex].id = socket.id;
+        socket.join(code);
+
+        // 3. Restaurar estado del cliente
+        // ¿Era el host?
+        const isHost = (room.host === oldSocketId); 
+        if (isHost) room.host = socket.id; // Actualizar host ID también
+
+        // Enviar datos actualizados a todos
+        io.to(code).emit("update_players", { players: room.players, hostId: room.host });
+
+        // Si la partida ya estaba en curso, hay que devolverle su ROL
+        if (room.gameState === "playing") {
+            socket.emit("game_started", room.players[playerIndex].roleData);
+        } else {
+            socket.emit("join_success", { roomCode: code, players: room.players });
+        }
+        
+    } else {
+        socket.emit("error_message", "No se pudo recuperar la sesión.");
+    }
+  });
 
   // --- CREAR SALA (CON PROTECCIÓN DE RATE LIMIT) ---
   socket.on("create_room", (rawPlayerName) => {
@@ -130,9 +180,6 @@ io.on("connection", (socket) => {
   });
 
   // --- INICIAR JUEGO ---
-  // index.js
-
-  // --- INICIAR JUEGO ---
   socket.on("start_game", ({ roomCode, wordData, impostorCount }) => {
     const room = rooms[roomCode];
     if (!room || room.host !== socket.id) return;
@@ -157,24 +204,52 @@ io.on("connection", (socket) => {
     room.gameState = "playing";
     room.players.forEach(player => {
         const isImpostor = impostors.includes(player.id);
-        io.to(player.id).emit("game_started", {
+        
+        // GUARDA EL ROL EN EL SERVIDOR
+        player.roleData = {
             role: isImpostor ? "impostor" : "citizen",
             word: isImpostor ? null : wordData.word,
             category: wordData.category,
             impostorHint: isImpostor ? wordData.hint : null,
-            startingPlayer: startingPlayerName // <--- Enviamos esto
-        });
+            startingPlayer: startingPlayerName
+        };
+
+        io.to(player.id).emit("game_started", player.roleData);
     });
   });
 
   socket.on("disconnect", () => {
-    roomCreationLimits.delete(socket.id); // Limpiar memoria
-    for (const code in rooms) {
-      if (rooms[code].players.find(p => p.id === socket.id)) {
-        handlePlayerExit(code);
-        break; 
-      }
-    }
+    console.log("Desconectado (esperando...):", socket.id);
+
+    // En lugar de borrar inmediatamente, esperamos 45 segundos
+    disconnectTimers[socket.id] = setTimeout(() => {
+        console.log("Tiempo agotado. Eliminando:", socket.id);
+        
+        // Lógica original de eliminación
+        for (const code in rooms) {
+            const room = rooms[code];
+            const playerIndex = room.players.findIndex(p => p.id === socket.id);
+            
+            if (playerIndex !== -1) {
+                const wasHost = (room.host === socket.id);
+                room.players.splice(playerIndex, 1); // Ahora sí lo borramos
+                
+                if (room.players.length === 0) {
+                    delete rooms[code];
+                } else {
+                    if (wasHost) {
+                        room.host = room.players[0].id;
+                    }
+                    io.to(code).emit("update_players", {
+                        players: room.players,
+                        hostId: room.host
+                    });
+                }
+                break;
+            }
+        }
+        delete disconnectTimers[socket.id]; // Limpiar timer
+    }, 45000); // 45 segundos de gracia
   });
 
   socket.on("reset_game", (roomCode) => {
