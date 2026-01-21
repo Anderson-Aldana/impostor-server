@@ -275,7 +275,152 @@ io.on("connection", (socket) => {
         });
     }
   });
+
+  // --- INICIAR FASE DE VOTACIÓN ---
+  socket.on("start_voting", (roomCode) => {
+    const room = rooms[roomCode];
+    if (!room || room.host !== socket.id) return;
+    if (room.gameState !== "playing") return;
+
+    room.gameState = "voting";
+    room.votes = {}; // Objeto simple para guardar votos: { "id_votante": "id_objetivo" }
+
+    // Filtramos solo jugadores VIVOS para que voten
+    const alivePlayers = room.players.filter(p => !p.isDead);
+    
+    // Enviamos solo los datos necesarios (id, name)
+    const candidates = alivePlayers.map(p => ({ id: p.id, name: p.name }));
+    
+    io.to(roomCode).emit("voting_phase_started", candidates);
+  });
+
+  // --- RECIBIR VOTO ---
+  socket.on("cast_vote", ({ roomCode, targetId }) => {
+    const room = rooms[roomCode];
+    if (!room || room.gameState !== "voting") return;
+
+    // Verificar si el jugador ya votó o está muerto
+    const voter = room.players.find(p => p.id === socket.id);
+    if (!voter || voter.isDead || room.votes[socket.id]) return;
+
+    // Registrar voto
+    room.votes[socket.id] = targetId;
+
+    // Contar cuántos vivos faltan por votar
+    const aliveCount = room.players.filter(p => !p.isDead).length;
+    const votesCount = Object.keys(room.votes).length;
+
+    // Si todos votaron, procesamos resultado
+    if (votesCount >= aliveCount) {
+        processVotingResult(roomCode);
+    }
+  });
 });
+
+// --- FUNCIÓN PARA PROCESAR RESULTADOS ---
+function processVotingResult(roomCode) {
+    const room = rooms[roomCode];
+    if (!room) return;
+
+    // 1. Contar Votos
+    const tallies = {};
+    Object.values(room.votes).forEach(targetId => {
+        tallies[targetId] = (tallies[targetId] || 0) + 1;
+    });
+
+    // 2. Encontrar quién tuvo más votos
+    let maxVotes = -1;
+    let eliminatedId = null;
+    
+    // En caso de empate, eliminamos al primero que encontremos (simple) 
+    // o a nadie (lógica compleja). Para este juego rápido: ELIMINA AL MÁS VOTADO.
+    for (const [target, count] of Object.entries(tallies)) {
+        if (count > maxVotes) {
+            maxVotes = count;
+            eliminatedId = target;
+        }
+    }
+
+    // 3. Ejecutar Eliminación
+    const victimIndex = room.players.findIndex(p => p.id === eliminatedId);
+    if (victimIndex !== -1) {
+        const victim = room.players[victimIndex];
+        victim.isDead = true; // MARCAR COMO MUERTO (NO BORRAR DEL ARRAY)
+        
+        // Notificar eliminación
+        room.players.forEach(p => {
+             io.to(p.id).emit("player_eliminated", {
+                 eliminatedId: victim.id,
+                 playerName: victim.name,
+                 isYou: (p.id === victim.id)
+             });
+        });
+
+        // 4. VERIFICAR CONDICIONES DE VICTORIA/DERROTA
+        
+        // A) ¿Era el impostor?
+        if (victim.roleData && victim.roleData.role === 'impostor') {
+            io.to(roomCode).emit("game_over", { 
+                winner: 'citizen', 
+                reason: `¡Atraparon al Impostor (${victim.name})!` 
+            });
+            resetRoomToLobby(room); // Función para volver al lobby
+            return;
+        }
+
+        // B) ¿Cuántos quedan?
+        const survivors = room.players.filter(p => !p.isDead);
+        
+        // REGLA DEL USUARIO: Si quedan 3 o menos (y el impostor sigue vivo), gana el Impostor.
+        // Ojo: Si eran 4, eliminamos a 1 inocente -> quedan 3 -> GAME OVER.
+        if (survivors.length <= 3) {
+            io.to(roomCode).emit("game_over", { 
+                winner: 'impostor', 
+                reason: "Quedan pocos jugadores. El Impostor domina la nave." 
+            });
+            resetRoomToLobby(room); // Función para volver al lobby
+            return;
+        }
+
+        // 5. SI EL JUEGO SIGUE (NEXT ROUND)
+        room.gameState = "playing";
+        room.votes = {}; // Limpiar votos
+        
+        // Elegir nuevo jugador inicial AL AZAR entre los vivos
+        const randomSurvivor = survivors[Math.floor(Math.random() * survivors.length)];
+        
+        io.to(roomCode).emit("next_round", {
+            startingPlayer: randomSurvivor.name
+        });
+
+    } else {
+        // Caso raro: Empate a 0 votos o error. Seguimos jugando.
+        room.gameState = "playing";
+        io.to(roomCode).emit("next_round", { startingPlayer: room.players.find(p => !p.isDead).name });
+    }
+}
+
+function resetRoomToLobby(room) {
+    room.gameState = "lobby";
+    room.votes = {};
+    // Revivir a todos para la próxima partida
+    room.players.forEach(p => { 
+        p.isDead = false; 
+        p.roleData = null; 
+    });
+    
+    // Pequeño delay para que lean el resultado antes de ir al lobby
+    setTimeout(() => {
+        io.to(room.players[0].id).emit("game_reset", room.players); // Usamos el evento existente
+        // Y actualizamos a todos
+        const hostId = room.host; 
+        // Nota: en tu codigo original game_reset mandaba al lobby.
+        // Asegurate de emitir update_players también
+        room.players.forEach(p => {
+             io.to(p.id).emit("game_reset", room.players);
+        });
+    }, 4000);
+}
 
 const PORT = process.env.PORT || 3000;
 httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
