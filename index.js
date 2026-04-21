@@ -223,21 +223,14 @@ io.on("connection", (socket) => {
     if (!room) return socket.emit("error_message", "Sala no encontrada.");
     if (room.players.length >= 12) return socket.emit("error_message", "Sala llena.");
 
-    // ── CASO: Reconexión durante juego ───────────────────────────────
-    // Busca al jugador por nombre (aunque cambió su socket ID)
+    // ── CASO: Reconexión durante juego o lobby ───────────────────────
+    // Si el nombre ya existe, permitimos que el nuevo socket tome el control
     const existingPlayer = room.players.find(
         p => p.name.toLowerCase() === playerName.toLowerCase()
     );
 
     if (existingPlayer) {
-        if (room.gameState === "lobby") {
-            // En lobby: nombre duplicado de un jugador activo
-            if (!existingPlayer.disconnected) {
-                return socket.emit("error_message", "Ese nombre ya está en uso en esta sala.");
-            }
-        }
-
-        // Reconexión válida: actualizar socket ID
+        // Reconexión válida: actualizar socket ID y estado
         const oldId = existingPlayer.id;
         existingPlayer.id = socket.id;
         existingPlayer.disconnected = false;
