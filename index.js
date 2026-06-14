@@ -47,11 +47,23 @@ function sanitizeInput(str) {
     return String(str).trim().substring(0, 50).replace(/[<>]/g, "");
 }
 
-// Cancela el timer de votación de una sala si existe
-function clearVotingTimer(room) {
+// Cancela todos los timers de una sala si existen
+function clearRoomTimers(room) {
     if (room._votingTimer) {
         clearTimeout(room._votingTimer);
         room._votingTimer = null;
+    }
+    if (room.hostTransferTimeout) {
+        clearTimeout(room.hostTransferTimeout);
+        room.hostTransferTimeout = null;
+    }
+    if (room.players) {
+        room.players.forEach(p => {
+            if (p.disconnectTimeout) {
+                clearTimeout(p.disconnectTimeout);
+                p.disconnectTimeout = null;
+            }
+        });
     }
 }
 
@@ -60,27 +72,27 @@ function processVotingResult(roomCode) {
     const room = rooms[roomCode];
     if (!room) return;
 
-    clearVotingTimer(room);
+    clearRoomTimers(room);
 
-    // 1. Contar Votos
+    // 1. Contar Votos (por nombre de destino)
     const tallies = {};
-    Object.values(room.votes).forEach(targetId => {
-        tallies[targetId] = (tallies[targetId] || 0) + 1;
+    Object.values(room.votes).forEach(targetName => {
+        tallies[targetName] = (tallies[targetName] || 0) + 1;
     });
 
     // 2. Encontrar al más votado
     let maxVotes = -1;
-    let eliminatedId = null;
+    let eliminatedName = null;
 
     for (const [target, count] of Object.entries(tallies)) {
         if (count > maxVotes) {
             maxVotes = count;
-            eliminatedId = target;
+            eliminatedName = target;
         }
     }
 
     // 3. Ejecutar Eliminación
-    const victimIndex = room.players.findIndex(p => p.id === eliminatedId);
+    const victimIndex = room.players.findIndex(p => p.name === eliminatedName);
 
     if (victimIndex !== -1) {
         const victim = room.players[victimIndex];
@@ -158,17 +170,28 @@ function processVotingResult(roomCode) {
 }
 
 function resetRoomToLobby(room, roomCode) {
-    clearVotingTimer(room);
+    clearRoomTimers(room);
     room.gameState = "lobby";
     room.votes = {};
+    
+    // Limpiar jugadores desconectados que nunca regresaron antes de volver al lobby
+    room.players = room.players.filter(p => {
+        if (p.disconnected) {
+            if (p.disconnectTimeout) {
+                clearTimeout(p.disconnectTimeout);
+            }
+            sessionMap.delete(p.id);
+            return false;
+        }
+        return true;
+    });
+
     room.players.forEach(p => {
         p.isDead = false;
         p.roleData = null;
-        p.disconnected = false; // al reiniciar, limpiar desconectados
     });
 
     setTimeout(() => {
-        // Solo emitir a jugadores aún conectados
         const connectedPlayers = room.players;
         connectedPlayers.forEach(p => {
             io.to(p.id).emit("game_reset", connectedPlayers);
@@ -221,7 +244,6 @@ io.on("connection", (socket) => {
     const room = rooms[code];
 
     if (!room) return socket.emit("error_message", "Sala no encontrada.");
-    if (room.players.length >= 12) return socket.emit("error_message", "Sala llena.");
 
     // ── CASO: Reconexión durante juego o lobby ───────────────────────
     // Si el nombre ya existe, permitimos que el nuevo socket tome el control
@@ -230,26 +252,37 @@ io.on("connection", (socket) => {
     );
 
     if (existingPlayer) {
-        // Reconexión válida: actualizar socket ID y estado
+        // Cancelar timeouts de desconexión del lobby si existían
+        if (existingPlayer.disconnectTimeout) {
+            clearTimeout(existingPlayer.disconnectTimeout);
+            existingPlayer.disconnectTimeout = null;
+        }
+
         const oldId = existingPlayer.id;
         existingPlayer.id = socket.id;
         existingPlayer.disconnected = false;
 
-        // Si era el host, transferir host al nuevo socket ID
+        // Si era el host y reconecta, restaurarlo y cancelar timeout de transferencia
         if (room.host === oldId) {
             room.host = socket.id;
+            if (room.hostTransferTimeout) {
+                clearTimeout(room.hostTransferTimeout);
+                room.hostTransferTimeout = null;
+            }
         }
 
         socket.join(code);
+        sessionMap.delete(oldId);
         sessionMap.set(socket.id, { roomCode: code, playerName });
 
-        // Avisarle su estado actual
+        // Avisarle su estado actual (añadimos isDead)
         socket.emit("rejoin_success", {
             roomCode: code,
             players: room.players,
             gameState: room.gameState,
             isHost: (room.host === socket.id),
-            roleData: existingPlayer.roleData || null
+            roleData: existingPlayer.roleData || null,
+            isDead: existingPlayer.isDead
         });
 
         // Avisar a todos que volvió
@@ -260,11 +293,18 @@ io.on("connection", (socket) => {
             hostId: room.host
         });
 
-        // Si la votación estaba activa, avisarle los candidatos actuales
-        if (room.gameState === "voting") {
+        // Si la votación estaba activa y el jugador está vivo, avisarle los candidatos actuales
+        if (room.gameState === "voting" && !existingPlayer.isDead) {
             const alivePlayers = room.players.filter(p => !p.isDead);
-            const candidates = alivePlayers.map(p => ({ id: p.id, name: p.name }));
-            socket.emit("voting_phase_started", candidates);
+            const candidates = alivePlayers.map(p => ({ 
+                id: p.id, 
+                name: p.name,
+                disconnected: p.disconnected
+            }));
+            socket.emit("voting_phase_started", {
+                candidates,
+                hasVoted: room.votes[existingPlayer.name] !== undefined
+            });
         }
 
         return;
@@ -274,6 +314,7 @@ io.on("connection", (socket) => {
     if (room.gameState !== "lobby") {
         return socket.emit("error_message", "La partida ya empezó y no estabas en esta sala.");
     }
+    if (room.players.length >= 12) return socket.emit("error_message", "Sala llena.");
 
     room.players.push({ id: socket.id, name: playerName, isDead: false, disconnected: false, roleData: null });
     socket.join(code);
@@ -293,18 +334,31 @@ io.on("connection", (socket) => {
     const playerIndex = room.players.findIndex(p => p.id === socket.id);
     if (playerIndex === -1) return;
 
+    const player = room.players[playerIndex];
+    if (player.disconnectTimeout) {
+        clearTimeout(player.disconnectTimeout);
+    }
+
     const wasHost = (room.host === socket.id);
     room.players.splice(playerIndex, 1);
 
     sessionMap.delete(socket.id);
 
     if (room.players.length === 0) {
-        clearVotingTimer(room);
+        clearRoomTimers(room);
         delete rooms[roomCode];
         console.log(`Sala ${roomCode} eliminada (vacía).`);
     } else {
         if (wasHost) {
-            room.host = room.players[0].id;
+            if (room.hostTransferTimeout) {
+                clearTimeout(room.hostTransferTimeout);
+                room.hostTransferTimeout = null;
+            }
+            const nextHost = room.players.find(p => !p.disconnected);
+            if (nextHost) {
+                room.host = nextHost.id;
+                io.to(nextHost.id).emit("you_are_now_host", {});
+            }
         }
         io.to(roomCode).emit("update_players", {
             players: room.players,
@@ -373,7 +427,7 @@ io.on("connection", (socket) => {
   socket.on("reset_game", (roomCode) => {
     const room = rooms[roomCode];
     if (room && room.host === socket.id) {
-        clearVotingTimer(room);
+        clearRoomTimers(room);
         room.gameState = "lobby";
         room.votes = {};
         room.players.forEach(p => {
@@ -412,12 +466,16 @@ io.on("connection", (socket) => {
     room.votes = {};
 
     const alivePlayers = room.players.filter(p => !p.isDead);
-    const candidates = alivePlayers.map(p => ({ id: p.id, name: p.name }));
+    const candidates = alivePlayers.map(p => ({ 
+        id: p.id, 
+        name: p.name,
+        disconnected: p.disconnected
+    }));
 
-    io.to(roomCode).emit("voting_phase_started", candidates);
+    io.to(roomCode).emit("voting_phase_started", { candidates, hasVoted: false });
 
     // Timer de seguridad: si en 120s no votan todos, procesamos igual
-    clearVotingTimer(room);
+    clearRoomTimers(room);
     room._votingTimer = setTimeout(() => {
         console.log(`[${roomCode}] Timeout de votación. Procesando votos actuales.`);
         if (room.gameState === "voting") {
@@ -434,7 +492,7 @@ io.on("connection", (socket) => {
     if (!room || room.host !== socket.id) return;
     if (room.gameState !== "voting") return;
 
-    clearVotingTimer(room);
+    clearRoomTimers(room);
     room.gameState = "playing";
     room.votes = {};
 
@@ -449,9 +507,13 @@ io.on("connection", (socket) => {
     if (!room || room.gameState !== "voting") return;
 
     const voter = room.players.find(p => p.id === socket.id);
-    if (!voter || voter.isDead || voter.disconnected || room.votes[socket.id]) return;
+    if (!voter || voter.isDead || voter.disconnected || room.votes[voter.name]) return;
 
-    room.votes[socket.id] = targetId;
+    const targetName = targetId;
+    const target = room.players.find(p => p.name === targetName);
+    if (!target || target.isDead) return;
+
+    room.votes[voter.name] = targetName;
 
     _checkVotingCompletion(roomCode);
   });
@@ -467,36 +529,64 @@ io.on("connection", (socket) => {
         const player = room.players.find(p => p.id === socket.id);
 
         if (player) {
-            if (room.gameState === "lobby") {
-                // En lobby: sacar al jugador directamente
-                room.players = room.players.filter(p => p.id !== socket.id);
-                sessionMap.delete(socket.id);
+            player.disconnected = true;
+            const wasHost = (room.host === socket.id);
 
-                if (room.players.length === 0) {
-                    clearVotingTimer(room);
-                    delete rooms[code];
-                    console.log(`Sala ${code} eliminada (vacía).`);
-                } else {
-                    if (room.host === socket.id) {
-                        room.host = room.players[0].id;
-                    }
-                    io.to(code).emit("update_players", {
-                        players: room.players,
-                        hostId: room.host
-                    });
+            if (room.gameState === "lobby") {
+                // En lobby: marcar como desconectado y dar grace period
+                if (wasHost) {
+                    room.hostTransferTimeout = setTimeout(() => {
+                        const nextHost = room.players.find(p => p.id !== socket.id && !p.disconnected);
+                        if (nextHost) {
+                            room.host = nextHost.id;
+                            io.to(nextHost.id).emit("you_are_now_host", {});
+                            io.to(code).emit("update_players", {
+                                players: room.players,
+                                hostId: room.host
+                            });
+                        }
+                        room.hostTransferTimeout = null;
+                    }, 10000); // 10s para transferir host
                 }
+
+                // Iniciar temporizador para expulsar al jugador de la sala
+                player.disconnectTimeout = setTimeout(() => {
+                    room.players = room.players.filter(p => p.id !== player.id);
+                    sessionMap.delete(player.id);
+
+                    if (room.players.length === 0) {
+                        clearRoomTimers(room);
+                        delete rooms[code];
+                        console.log(`Sala ${code} eliminada (vacía).`);
+                    } else {
+                        io.to(code).emit("update_players", {
+                            players: room.players,
+                            hostId: room.host
+                        });
+                    }
+                }, 10000); // 10s de periodo de gracia en lobby
+
+                // Notificar a todos en el lobby que está desconectado temporalmente
+                io.to(code).emit("update_players", {
+                    players: room.players,
+                    hostId: room.host
+                });
+
             } else {
                 // En juego/votación: marcar como desconectado (RESERVAR SU ROL)
-                player.disconnected = true;
-
-                const wasHost = (room.host === socket.id);
                 if (wasHost) {
-                    // Transferir host al siguiente jugador conectado
-                    const nextHost = room.players.find(p => p.id !== socket.id && !p.disconnected);
-                    if (nextHost) {
-                        room.host = nextHost.id;
-                        io.to(nextHost.id).emit("you_are_now_host", {});
-                    }
+                    room.hostTransferTimeout = setTimeout(() => {
+                        const nextHost = room.players.find(p => p.id !== socket.id && !p.disconnected);
+                        if (nextHost) {
+                            room.host = nextHost.id;
+                            io.to(nextHost.id).emit("you_are_now_host", {});
+                            io.to(code).emit("update_players", {
+                                players: room.players,
+                                hostId: room.host
+                            });
+                        }
+                        room.hostTransferTimeout = null;
+                    }, 10000); // 10s para transferir host en juego
                 }
 
                 // Avisar a todos
@@ -527,10 +617,12 @@ function _checkVotingCompletion(roomCode) {
 
     // Jugadores vivos Y conectados son los únicos que pueden votar
     const aliveAndConnected = room.players.filter(p => !p.isDead && !p.disconnected);
-    const votesCount = Object.keys(room.votes).length;
+    
+    // Contar los votos de los que están vivos y conectados
+    const activeVotesCount = aliveAndConnected.filter(p => room.votes[p.name] !== undefined).length;
 
     // Procesamos si todos los que pueden votar ya votaron
-    if (votesCount >= aliveAndConnected.length && aliveAndConnected.length > 0) {
+    if (activeVotesCount >= aliveAndConnected.length && aliveAndConnected.length > 0) {
         processVotingResult(roomCode);
     }
 }
