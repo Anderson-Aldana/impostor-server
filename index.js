@@ -132,7 +132,7 @@ function processVotingResult(roomCode) {
 
             io.to(roomCode).emit("game_over", {
                 winner: 'impostor',
-                reason: "Los Impostores han tomado el control de la nave.",
+                reason: "Los Impostores ganan.",
                 impostorNames: allImpostors
             });
             resetRoomToLobby(room, roomCode);
