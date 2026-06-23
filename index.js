@@ -68,19 +68,27 @@ function processVotingResult(roomCode) {
         tallies[targetId] = (tallies[targetId] || 0) + 1;
     });
 
-    // 2. Encontrar al más votado
-    let maxVotes = -1;
+    // 2. Encontrar al más votado y verificar si hay empate
+    let maxVotes = 0;
     let eliminatedId = null;
+    let isTie = false;
 
     for (const [target, count] of Object.entries(tallies)) {
         if (count > maxVotes) {
             maxVotes = count;
             eliminatedId = target;
+            isTie = false;
+        } else if (count === maxVotes) {
+            isTie = true;
         }
     }
 
+    if (isTie) {
+        eliminatedId = null; // Si hay empate, nadie es eliminado
+    }
+
     // 3. Ejecutar Eliminación
-    const victimIndex = room.players.findIndex(p => p.id === eliminatedId);
+    const victimIndex = room.players.findIndex(p => p.name === eliminatedId);
 
     if (victimIndex !== -1) {
         const victim = room.players[victimIndex];
